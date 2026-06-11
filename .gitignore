@@ -18,3 +18,5 @@ installer/requirements.txt
 installer/quantide.bmp
 installer/quantide.ico
 installer/contact-us.bmp
+installer/nssm.exe
+installer/.nssm-cache/

@@ -29,13 +29,17 @@ SetCompress off
 !define REQUIREMENTS_NAME "requirements.txt"
 !define REQUIREMENTS_PATH "${__FILEDIR__}\${REQUIREMENTS_NAME}"
 
-; #67 / #68: build-time preprocessor steps.
+; #67 / #68 / #74: build-time preprocessor steps.
 ;   - generate-requirements.py writes installer\requirements.txt from pyproject.toml.
 ;   - generate-bitmaps.ps1 converts quantide.png / contact-us.png to the BMP
 ;     format that MUI2 requires for MUI_WELCOMEFINISHPAGE_BITMAP and produces
 ;     quantide.ico for MUI_ICON / MUI_UNICON.
+;   - download-nssm.ps1 caches nssm.exe under installer\ so the Core section
+;     can ship it. nssm wraps the embedded python as a Windows service so the
+;     gateway runs at boot, restarts on crash, and writes its own logs (#66).
 !system 'python ".\generate-requirements.py" "..\pyproject.toml" ".\requirements.txt"' = 0
 !system 'powershell -NoProfile -ExecutionPolicy Bypass -File ".\generate-bitmaps.ps1"' = 0
+!system 'powershell -NoProfile -ExecutionPolicy Bypass -File ".\download-nssm.ps1"' = 0
 
 ; The NSIS built-in zip plugin is not part of the default choco NSIS 3.x
 ; install, so we do not rely on it. python-embed.zip is extracted with the
@@ -111,8 +115,12 @@ SetCompress off
 ; !insertmacro MUI_PAGE_COMPONENTS, otherwise MUI_DESCRIPTION_TEXT expands
 ; the language id to a numeric code and the component selection page
 ; shows mojibake instead of the description (#51).
-LangString DESC_SEC_CORE ${LANG_SIMPCHINESE} "核心组件（必须安装）"
-LangString DESC_SEC_AUTOSTART ${LANG_SIMPCHINESE} "开机自启（用户登录时自动启动）"
+;
+; #66: SEC_AUTOSTART is removed. Auto-start at boot is now provided by the
+; Windows service installed in SEC_CORE via nssm; users no longer need to
+; opt in, and the previous logon-time scheduled task / start-silent.vbs
+; flow is gone.
+LangString DESC_SEC_CORE ${LANG_SIMPCHINESE} "核心组件（必须安装，将作为 Windows 服务后台运行并开机自启）"
 LangString DESC_SEC_FIREWALL ${LANG_SIMPCHINESE} "防火墙入站规则（允许局域网访问）"
 
 ; Failure dialog
@@ -144,10 +152,14 @@ var ICONS_GROUP
 !insertmacro MUI_PAGE_INSTFILES
 
 ; Finish page - MUI2 reads MUI_TEXT_FINISH_INFO_TITLE/TEXT defined above.
-!define MUI_FINISHPAGE_RUN_TEXT "立即启动 $(^Name)"
+;
+; #66: the gateway is installed as a Windows service that starts at the end
+; of SEC_CORE, so the "run now" checkbox is intentionally removed. The
+; "view install log" checkbox is kept (unchecked) as a diagnostic shortcut.
+; The browser is opened automatically by Section -Post once the service is
+; reachable on http://localhost:8130, so the user does not have to click
+; anything to see the gateway UI.
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "查看安装日志"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\start.bat"
-!define MUI_FINISHPAGE_RUN_NOTCHECKED
 !define MUI_FINISHPAGE_SHOWREADME "$INSTDIR\${INSTALL_LOG_NAME}"
 !define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
 !insertmacro MUI_PAGE_FINISH
@@ -273,9 +285,22 @@ Section "-Core" SEC_CORE
     SetOutPath "$INSTDIR"
 
     !insertmacro LogStep "Core: copy startup scripts"
-    ; Copy startup scripts
+    ; start.bat is retained as a manual / debug entry point that runs the
+    ; gateway in a console window. start-service.bat is the wrapper the
+    ; QMTGateway Windows service invokes: it sets the per-service
+    ; environment (QMT_GATEWAY_HOME, PYTHONPATH, ...) and then runs the
+    ; embedded python. nssm's AppEnvironmentExtra cannot reliably carry the
+    ; multi-line block we need under PowerShell 5.1 quoting, so we go via
+    ; this wrapper instead (#66).
     File "start.bat"
-    File "start-silent.vbs"
+    File "start-service.bat"
+
+    !insertmacro LogStep "Core: copy nssm.exe"
+    ; nssm.exe wraps python.exe as a Windows service. The Core section ships
+    ; it next to start.bat so install-service.ps1 (and the uninstaller) can
+    ; locate it via the same registry-driven InstallLocation lookup used by
+    ; install-python.ps1.
+    File "nssm.exe"
 
     !insertmacro LogStep "Core: bootstrap pip"
     ; Embed Python does not ship with venv/pip. Bootstrap pip with get-pip.py and
@@ -292,21 +317,25 @@ Section "-Core" SEC_CORE
     !insertmacro AbortOnExecFailure "Install Python dependencies"
 
     !insertmacro LogStep "Core: write shortcuts"
-    ; Shortcuts
+    ; Shortcuts - since the gateway runs as a service and the UI is just a
+    ; web page on http://localhost:8130, shortcuts open the URL directly via
+    ; the .url internet shortcut written in Section -Post / -AdditionalIcons.
+    ; start.bat is kept for advanced/debug usage but is not exposed as a
+    ; shortcut to avoid confusing users who would then run a second copy in
+    ; a console.
     !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     CreateDirectory "$SMPROGRAMS\$ICONS_GROUP"
-    CreateShortCut "$SMPROGRAMS\$ICONS_GROUP\${PRODUCT_NAME}.lnk" "$INSTDIR\start.bat"
-    CreateShortCut "$SMPROGRAMS\$ICONS_GROUP\${PRODUCT_NAME} (静默启动).lnk" "$INSTDIR\start-silent.vbs"
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\start-silent.vbs"
     !insertmacro MUI_STARTMENU_WRITE_END
 
-    !insertmacro LogStep "Core: done"
-SectionEnd
+    !insertmacro LogStep "Core: install windows service"
+    ; Register and start the QMTGateway Windows service via nssm. The script
+    ; reads InstallLocation from the registry (already written above) so
+    ; PowerShell never has to handle CJK paths on the command line.
+    DetailPrint "正在安装并启动 QMT Gateway 服务..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-service.ps1" -Stage Install'
+    !insertmacro AbortOnExecFailure "Install Windows service"
 
-Section "Autostart" SEC_AUTOSTART
-    !insertmacro LogStep "Autostart: register scheduled task"
-    DetailPrint "正在注册开机自启任务..."
-    nsExec::ExecToLog 'schtasks /create /tn "QMT Gateway" /tr "wscript.exe \"$INSTDIR\start-silent.vbs\"" /sc onlogon /rl limited /f'
+    !insertmacro LogStep "Core: done"
 SectionEnd
 
 Section "Firewall" SEC_FIREWALL
@@ -316,15 +345,30 @@ Section "Firewall" SEC_FIREWALL
 SectionEnd
 
 ; Section descriptions are defined earlier, before MUI_PAGE_COMPONENTS,
-; so MUI_DESCRIPTION_TEXT can resolve the localized strings at compile time
+; so MUI_DESCRIPTION_TEXT can resolve the localized strings at compile time.
+;
+; #66: SEC_AUTOSTART no longer exists - auto-start is provided by the
+; QMTGateway Windows service installed unconditionally in SEC_CORE.
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} $(DESC_SEC_CORE)
-    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_AUTOSTART} $(DESC_SEC_AUTOSTART)
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_FIREWALL} $(DESC_SEC_FIREWALL)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Function OpenBrowser
     ExecShell "open" "http://localhost:8130"
+FunctionEnd
+
+; Wait until the QMTGateway service is reachable on http://localhost:8130,
+; then open the default browser on the gateway UI. Called from the very end
+; of Section -Post (which runs after every other section, including the
+; firewall section that may need the port). We cap the wait at 30 s so an
+; unhealthy service does not block the installer's finish page forever;
+; if the wait times out, we still open the browser so the user can read the
+; service's recent logs and see the failure reason directly.
+Function WaitForServiceAndOpenBrowser
+    DetailPrint "正在等待 QMT Gateway 服务就绪..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "for ($i=0;$i -lt 30;$i++) { try { $r=(Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:8130/ -TimeoutSec 2); if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) { exit 0 } } catch { }; Start-Sleep -Seconds 1 }; exit 0"'
+    Call OpenBrowser
 FunctionEnd
 
 
@@ -343,6 +387,12 @@ Section -Post
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
     WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
+
+    ; #66: once everything is on disk, wait for the service to come up and
+    ; open the gateway UI in the user's default browser. Runs at the very
+    ; end of -Post so it sees the firewall rule (if the user enabled it)
+    ; and the service installation from SEC_CORE.
+    Call WaitForServiceAndOpenBrowser
 SectionEnd
 
 ; Uninstaller
@@ -351,13 +401,22 @@ Function un.onInit
 FunctionEnd
 
 Section Uninstall
-    ; Stop running processes
+    ; Stop the QMTGateway Windows service. install-service.ps1 reads
+    ; InstallLocation from the registry so we do not need to pass the
+    ; install dir on the command line.
+    DetailPrint "正在停止 QMT Gateway 服务..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-service.ps1" -Stage Uninstall'
+
+    ; Best-effort fallback for legacy installs that pre-date the service:
+    ; kill any stray python / qmt-gateway processes the service may have
+    ; left behind during a non-graceful shutdown.
     DetailPrint "正在停止 qmt-gateway 进程..."
     nsExec::ExecToLog 'taskkill /F /IM "qmt-gateway.exe"'
     nsExec::ExecToLog 'taskkill /F /IM "python.exe" /FI "WINDOWTITLE eq QMT*"'
 
-    ; Remove scheduled task
-    DetailPrint "正在删除开机自启任务..."
+    ; Remove legacy scheduled task from releases that still shipped
+    ; start-silent.vbs + onlogon task. Silent because newer installs do not
+    ; have it.
     nsExec::ExecToLog 'schtasks /delete /tn "QMT Gateway" /f'
 
     ; Remove firewall rule
@@ -366,11 +425,8 @@ Section Uninstall
 
     ; Remove shortcuts
     !insertmacro MUI_STARTMENU_GETFOLDER Application $ICONS_GROUP
-    Delete "$SMPROGRAMS\$ICONS_GROUP\${PRODUCT_NAME}.lnk"
-    Delete "$SMPROGRAMS\$ICONS_GROUP\${PRODUCT_NAME} (静默启动).lnk"
     Delete "$SMPROGRAMS\$ICONS_GROUP\Website.lnk"
     Delete "$SMPROGRAMS\$ICONS_GROUP\Uninstall.lnk"
-    Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
     RMDir "$SMPROGRAMS\$ICONS_GROUP"
 
     ; Ask about data directory
@@ -391,7 +447,9 @@ Section Uninstall
     RMDir /r "$INSTDIR\.venv"
     RMDir /r "$INSTDIR\app"
     Delete "$INSTDIR\start.bat"
-    Delete "$INSTDIR\start-silent.vbs"
+    Delete "$INSTDIR\start-service.bat"
+    Delete "$INSTDIR\nssm.exe"
+    Delete "$INSTDIR\install-service.ps1"
     Delete "$INSTDIR\uninstall.exe"
     Delete "$INSTDIR\${PRODUCT_NAME}.url"
     ; Clean any other top-level files (e.g. qmt_gateway sources installed at root)

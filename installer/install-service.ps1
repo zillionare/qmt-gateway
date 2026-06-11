@@ -24,7 +24,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$ServiceName        = 'QMTGateway'
+$ServiceName        = 'QuantideGateway'
 $ServiceDisplayName = '匡醍 QMT 交易网关'
 $ServiceDescription = '后台运行 qmt-gateway，开机自启并在异常退出时自动重启。'
 $InstallLogName     = 'install.log'
@@ -102,6 +102,36 @@ function Test-ServiceExists {
     return [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
 }
 
+function Set-ServiceMetadata {
+    # Write DisplayName / Description (REG_SZ, UTF-16) directly into the
+    # service's registry key. nssm's `set DisplayName|Description` goes
+    # through argv -> MultiByteToWideChar(CP_ACP) -> RegSetValueExW and
+    # corrupts CJK characters when the host's ANSI code page is not a
+    # CJK CP (eg. 437 on the GitHub runner). The .NET Registry API
+    # always writes the REG_SZ as UTF-16LE so services.msc displays the
+    # string correctly regardless of the host's ANSI code page.
+    Add-InstallerLogLine ('Service: write DisplayName / Description as UTF-16 REG_SZ: ' + $ServiceDisplayName)
+    $key = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        $env:COMPUTERNAME
+    )
+    $sub = $null
+    try {
+        $sub = $key.OpenSubKey(
+            "SYSTEM\CurrentControlSet\Services\$ServiceName",
+            $true
+        )
+        if ($null -eq $sub) {
+            throw "service registry key not found"
+        }
+        $sub.SetValue('DisplayName', $ServiceDisplayName, [Microsoft.Win32.RegistryValueKind]::String)
+        $sub.SetValue('Description', $ServiceDescription, [Microsoft.Win32.RegistryValueKind]::String)
+    } finally {
+        if ($sub) { $sub.Dispose() }
+        $key.Dispose()
+    }
+}
+
 function Stop-ServiceIfRunning {
     if (-not (Test-ServiceExists)) { return }
     try {
@@ -131,8 +161,12 @@ function Invoke-InstallStage {
     if (-not (Test-Path -LiteralPath $NssmExe)) {
         throw "nssm.exe not found at $NssmExe"
     }
+    # python.exe is only required for actually running the gateway. The
+    # service metadata + recovery policy can be installed without it; that
+    # is useful for offline / smoke-test scenarios where we want to verify
+    # the service scaffolding without a full NSIS run.
     if (-not (Test-Path -LiteralPath $PythonExe)) {
-        throw "python.exe not found at $PythonExe"
+        Add-InstallerLogLine ('Service: WARNING - python.exe missing at ' + $PythonExe + '; continuing without it')
     }
 
     New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
@@ -161,8 +195,8 @@ function Invoke-InstallStage {
     # Service metadata + working directory. nssm `set` calls in this
     # block have all been verified end-to-end on Windows 10 22H2 /
     # nssm 2.24-101; do not add new keys here without also testing them.
-    $null = Invoke-Nssm @('set', $ServiceName, 'DisplayName',  $ServiceDisplayName)
-    $null = Invoke-Nssm @('set', $ServiceName, 'Description',  $ServiceDescription)
+    # DisplayName / Description are written directly to the registry
+    # (REG_SZ, UTF-16) below the nssm `set` block - see Set-ServiceMetadata.
     $null = Invoke-Nssm @('set', $ServiceName, 'AppDirectory', $InstallDir)
     $null = Invoke-Nssm @('set', $ServiceName, 'Start',        'SERVICE_AUTO_START')
 
@@ -179,6 +213,31 @@ function Invoke-InstallStage {
     $null = Invoke-Nssm @('set', $ServiceName, 'AppExit',         'Default', 'Restart')
     $null = Invoke-Nssm @('set', $ServiceName, 'AppRestartDelay', '5000')
     $null = Invoke-Nssm @('set', $ServiceName, 'AppThrottle',     '5000')
+
+    # DisplayName / Description: write REG_SZ (UTF-16) directly. nssm's
+    # `set DisplayName ...` goes through MultiByteToWideChar(CP_ACP) and
+    # when the system code page is not a CJK CP (eg. CI runner is 437),
+    # Chinese characters turn into '?' (0x3F) in the registry. The .NET
+    # Registry API always writes UTF-16LE for REG_SZ, which is what
+    # services.msc expects to see. Done before `start` so it survives even
+    # if the first start fails (eg. python not yet on PATH).
+    Set-ServiceMetadata
+
+    # Recovery policy: on first / second / subsequent crash, restart the
+    # service after 60 s. We use sc.exe rather than nssm because nssm's
+    # `set FailureActions` writes the registry value as MBCS bytes and
+    # services.msc shows the action label as mojibake on non-UTF8 system
+    # code pages; sc.exe uses ChangeServiceConfig2 and writes a proper
+    # UTF-16 REG_SZ / binary structure.
+    Add-InstallerLogLine 'Service: configure recovery policy (sc.exe failure)'
+    $failureOutput = & cmd.exe /c 'sc failure QuantideGateway reset= 0 actions= restart/60000/restart/60000/restart/60000' 2>&1
+    foreach ($line in $failureOutput) {
+        $line | Out-Default
+        Add-InstallerLogLine ('  ' + $line)
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Add-InstallerLogLine ('Service: WARNING - sc.exe failure returned ' + $LASTEXITCODE)
+    }
 
     Add-InstallerLogLine ('Service: starting ' + $ServiceName)
     $exit = Invoke-Nssm @('start', $ServiceName)

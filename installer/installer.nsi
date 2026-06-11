@@ -301,6 +301,7 @@ Section "-Core" SEC_CORE
     ; locate it via the same registry-driven InstallLocation lookup used by
     ; install-python.ps1.
     File "nssm.exe"
+    File "install-service.ps1"
 
     !insertmacro LogStep "Core: bootstrap pip"
     ; Embed Python does not ship with venv/pip. Bootstrap pip with get-pip.py and

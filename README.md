@@ -1,3 +1,7 @@
+2026年10月27日更新：
+
+因 mini-qmt 已不再支持实盘交易，本项目终止。感谢您的关注！
+
 # 匡醍 QMT 交易网关
 
 > 一个独立的 Windows 网关服务，封装 [QMT（迅投量化交易终端）](https://www.thinktrader.net/) 的 `xtquant` SDK，将交易、行情等功能以 HTTP / WebSocket API 的形式对外暴露。策略程序可以在任意平台运行，无需依赖 QMT 自带的 Python 环境。
